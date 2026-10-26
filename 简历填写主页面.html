@@ -1120,6 +1120,12 @@ body{
                  placeholder="https://你的服务域名">
         </div>
         <div class="ai-cfg-row">
+          <label for="aiApiKey">服务密钥</label>
+          <input class="ai-input" id="aiApiKey" type="password" spellcheck="false" autocomplete="off"
+                 placeholder="sk-...（填一次即可，保存在本机）">
+          <button class="ai-mini" id="aiKeySave" type="button">保存</button>
+        </div>
+        <div class="ai-cfg-row">
           <label for="aiModel">模型</label>
           <select class="ai-input" id="aiModel">
             <option value="">自动（按服务端上游选择，推荐）</option>
@@ -1143,7 +1149,8 @@ body{
         </div>
         <div class="ai-status" id="aiSetupStatus"></div>
         <div class="ai-cfg-hint">
-          服务地址由部署方提供，密钥保存在服务端，本页面不接触也无法获取。
+          密钥会写入本机的 <code>.env</code> 文件，只供本机服务调用模型使用，不会上传到任何地方。
+          还没有密钥？去 <a href="https://platform.deepseek.com" target="_blank" rel="noopener">platform.deepseek.com</a> 申请。
         </div>
       </div>
 
@@ -3239,6 +3246,8 @@ body{
   var aiSetup       = document.getElementById('aiSetup');
   var aiSetupClose  = document.getElementById('aiSetupClose');
   var aiEndpoint    = document.getElementById('aiEndpoint');
+  var aiApiKey      = document.getElementById('aiApiKey');
+  var aiKeySave     = document.getElementById('aiKeySave');
   var aiModelSel    = document.getElementById('aiModel');
   var aiEngineSel   = document.getElementById('aiEngine');
   var aiSetupStatus = document.getElementById('aiSetupStatus');
@@ -3271,11 +3280,22 @@ body{
     if(!SVC || probeBusy || effectiveEngine() !== 'proxy') return;
     probeBusy = true;
     var ep = SVC.getEndpoint();
-    SVC.ping().then(function(ok){
-      if(ok || lastResult || busy) return;   // 有结果/正在解析时不要覆盖当前状态
-      aiNote.textContent = '⚠️ 连接不上解析服务（' + ep + '）。请先启动本地服务：双击 start.bat；'
-        + '若要改地址，按 Ctrl+Shift+, 打开设置。';
-    }).finally(function(){ probeBusy = false; });
+    fetch(ep + '/health', { cache: 'no-store' })
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if(!d) throw new Error('bad response');
+        if(d.keyConfigured === false && !lastResult && !busy){
+          // 没密钥：直接把设置面板展开，用户填一次就能用
+          aiNote.textContent = '⚠️ 还没有配置 API Key，请在下方「解析服务设置」里填入（只需要一次）。';
+          if(aiSetup.hidden) toggleSetup(true);
+        }
+      })
+      .catch(function(){
+        if(lastResult || busy) return;   // 有结果/正在解析时不要覆盖当前状态
+        aiNote.textContent = '⚠️ 连接不上解析服务（' + ep + '）。请先启动本地服务：双击 start.bat；'
+          + '若要改地址，按 Ctrl+Shift+, 打开设置。';
+      })
+      .finally(function(){ probeBusy = false; });
   }
 
   /* ---------------- 解析引擎与设置 ---------------- */
@@ -3300,13 +3320,31 @@ body{
   function refreshSetupStatus(){
     if(!SVC){ aiSetupStatus.textContent = '服务模块未加载'; aiSetupStatus.className = 'ai-status err'; return; }
     var ep = SVC.getEndpoint();
-    if(ep){
-      aiSetupStatus.textContent = '已配置服务：' + ep;
-      aiSetupStatus.className = 'ai-status ok';
-    } else {
+    if(!ep){
       aiSetupStatus.textContent = '尚未配置服务地址，将使用本地规则解析';
       aiSetupStatus.className = 'ai-status err';
+      return;
     }
+    aiSetupStatus.textContent = '正在检查服务…';
+    aiSetupStatus.className = '';
+    // 顺便问一下服务端的密钥状态：没配就直接把用户引到输入框，省得他先去猜原因
+    fetch(ep + '/health', { cache: 'no-store' })
+      .then(function(r){ return r.ok ? r.json() : null; })
+      .then(function(d){
+        if(!d) throw new Error('bad response');
+        if(d.keyConfigured === false){
+          aiSetupStatus.textContent = '⚠️ 服务端还没有密钥，请在上方填入你的 API Key';
+          aiSetupStatus.className = 'ai-status err';
+          setTimeout(function(){ if(aiApiKey) aiApiKey.focus(); }, 60);
+        } else {
+          aiSetupStatus.textContent = '✅ 服务已就绪：' + ep;
+          aiSetupStatus.className = 'ai-status ok';
+        }
+      })
+      .catch(function(){
+        aiSetupStatus.textContent = '连不上服务，请先启动 start.bat（' + ep + '）';
+        aiSetupStatus.className = 'ai-status err';
+      });
   }
 
   function toggleSetup(show){
@@ -3356,6 +3394,44 @@ body{
     engine = aiEngineSel.value;
     refreshBadge();
     resetPreview();
+  });
+
+  /* 在页面上填密钥：交给本机服务写进 .env，省得用户手动改文件 */
+  aiKeySave.addEventListener('click', function(){
+    if(!SVC) return;
+    var k = aiApiKey.value.trim();
+    if(!k){
+      aiSetupStatus.textContent = '请先粘贴你的 API Key（以 sk- 开头）';
+      aiSetupStatus.className = 'ai-status err';
+      aiApiKey.focus();
+      return;
+    }
+    var btn = aiKeySave;
+    btn.disabled = true; btn.textContent = '保存中';
+    fetch(SVC.getEndpoint() + '/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey: k })
+    }).then(function(r){
+      return r.text().then(function(t){
+        var d = {}; try { d = t ? JSON.parse(t) : {}; } catch(e){}
+        if(!r.ok) throw new Error((d && d.error) || ('HTTP ' + r.status));
+        return d;
+      });
+    }).then(function(){
+      aiApiKey.value = '';   // 不回显密钥，保存后就清空
+      aiSetupStatus.textContent = '✅ 密钥已保存，现在可以开始解析了';
+      aiSetupStatus.className = 'ai-status ok';
+      refreshBadge();
+    }).catch(function(err){
+      aiSetupStatus.textContent = '❌ 保存失败：' + (err && err.message ? err.message : '未知错误');
+      aiSetupStatus.className = 'ai-status err';
+    }).finally(function(){
+      btn.disabled = false; btn.textContent = '保存';
+    });
+  });
+  aiApiKey.addEventListener('keydown', function(e){
+    if(e.key === 'Enter'){ e.preventDefault(); aiKeySave.click(); }
   });
 
   /* 初始化：读取已保存的服务地址、模型与引擎 */

@@ -81,6 +81,24 @@ resume-ai-proxy/
   "models": ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"] }
 ```
 
+### `POST /api/config`
+
+供页面上的「服务密钥」输入框使用：把密钥写入同目录 `.env` 并**立即生效**（无需重启）。
+
+```json
+{ "apiKey": "sk-..." }
+```
+
+- **仅接受本机请求**：依据 `req.socket.remoteAddress` 判断（`127.0.0.1` / `::1` / `::ffff:127.x`），
+  远程访问返回 `403`。这里**不能**用 `X-Forwarded-For`，它可被伪造。
+- 校验规则同 `isRealKey()`：必须 `sk-` 开头、长度足够、且不是 `.env.example` 里的占位符。
+- 只替换 `.env` 中的 `DEEPSEEK_API_KEY` 行，其它配置与注释原样保留；重复调用不会产生重复行。
+
+成功返回 `{ "ok": true, "keyConfigured": true }`。
+
+> 这也意味着：部署到公网后，页面上的密钥输入框会因 403 而不可用 —— 这是有意为之，
+> 远程部署请用平台的环境变量配置密钥。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |

@@ -5,19 +5,20 @@
    简历智能填写 · 后端代理服务
    --------------------------------------------------------------------------
    职责：接收前端提交的自由文本 -> 调用 DeepSeek -> 规整为固定结构 -> 返回
-   要点：DeepSeek 的 API Key 只存在于本服务端，前端完全接触不到。
+   要点：DeepSeek 的 API Key 只保存在本机服务端（.env），
+         前端可以把用户输入的密钥交给它，但自身不持久保存。
    依赖：无（仅使用 Node 内置模块，需要 Node 18+ 以获得全局 fetch）
    ========================================================================== */
 
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
 /* --------------------------- 本地环境变量 --------------------------- */
 // 零依赖读取同目录下的 .env（该文件已写入 .gitignore，不会被提交到仓库）。
 // 真实环境变量优先级更高，便于部署平台直接覆盖。
 (function loadDotEnv() {
   try {
-    const fs = require('fs');
-    const path = require('path');
     const file = path.join(__dirname, '.env');
     if (!fs.existsSync(file)) return;
     fs.readFileSync(file, 'utf8').split(/\r?\n/).forEach(function (line) {
@@ -48,8 +49,10 @@ const DEEPSEEK_ENDPOINT = process.env.DEEPSEEK_ENDPOINT || 'https://api.deepseek
 
 // 密钥只从环境变量或同目录 .env 读取，源码中不保留任何真实 Key。
 // 本地开发：把 .env.example 复制成 .env，填入自己的 Key。
+// 也可以用页面右上角的设置面板直接填入（会写回这个 .env 文件）。
 // 部署平台：在平台的环境变量 / Secret 配置里设置 DEEPSEEK_API_KEY。
-const API_KEY = process.env.DEEPSEEK_API_KEY || '';
+const API_KEY_FILE = path.join(__dirname, '.env');
+let API_KEY = process.env.DEEPSEEK_API_KEY || '';
 
 // 模型白名单。前两个别名适用于自建/中转网关；
 // 若把 DEEPSEEK_ENDPOINT 指到官方 api.deepseek.com，请选 deepseek-v4-flash / deepseek-v4-pro
@@ -338,14 +341,33 @@ function readBody(req) {
   });
 }
 
-function keyLooksValid() {
-  if (!/^sk-[A-Za-z0-9_-]{16,}$/.test(API_KEY)) return false;
+function isRealKey(key) {
+  const s = String(key || '').trim();
+  if (!/^sk-[A-Za-z0-9_-]{16,}$/.test(s)) return false;
   // 排除 .env.example 里的占位符。否则「照抄模板忘了改」会显示「密钥已就绪」，
   // 直到真正调用才报 401，排查成本很高。
-  return !/your[-_]?key|placeholder|change[-_]?me|xxxx/i.test(API_KEY);
+  return !/your[-_]?key|placeholder|change[-_]?me|xxxx/i.test(s);
 }
-function keyIsPlaceholder() {
-  return !!API_KEY && !keyLooksValid();
+function keyLooksValid() { return isRealKey(API_KEY); }
+function keyIsPlaceholder() { return !!API_KEY && !keyLooksValid(); }
+
+/* 把密钥写回同目录的 .env：保留其它配置行，只替换 DEEPSEEK_API_KEY。
+   页面上的「保存密钥」走这里，用户就不必手动编辑文件了。 */
+function saveApiKey(key) {
+  let content = '';
+  try { content = fs.readFileSync(API_KEY_FILE, 'utf8'); } catch (e) { content = ''; }
+  const out = [];
+  let replaced = false;
+  content.split(/\r?\n/).forEach(function (line) {
+    if (/^\s*#?\s*DEEPSEEK_API_KEY\s*=/.test(line)) {
+      if (!replaced) { out.push('DEEPSEEK_API_KEY=' + key); replaced = true; }
+      return;   // 同名的重复行 / 被注释掉的旧值都丢掉
+    }
+    out.push(line);
+  });
+  if (!replaced) out.push('DEEPSEEK_API_KEY=' + key);
+  const text = out.join('\n').replace(/\n{3,}/g, '\n\n').replace(/\s+$/, '') + '\n';
+  fs.writeFileSync(API_KEY_FILE, text, 'utf8');
 }
 
 /* --------------------------- 调用 DeepSeek --------------------------- */
@@ -417,6 +439,41 @@ async function handle(req, res) {
       keyConfigured: keyLooksValid(),
       models: MODELS
     });
+    return;
+  }
+
+  // 页面上保存 API Key：只允许本机访问。
+  // 注意不能看 X-Forwarded-For（可伪造），必须用 TCP 连接的 remoteAddress。
+  if (path === '/api/config') {
+    if (req.method !== 'POST') { sendJSON(res, 405, { error: '仅支持 POST 请求' }); return; }
+    const remote = String((req.socket && req.socket.remoteAddress) || '');
+    const isLocal = /^127\./.test(remote) || remote === '::1' || /^::ffff:127\./.test(remote);
+    if (!isLocal) {
+      sendJSON(res, 403, { error: '密钥只能在本机（127.0.0.1）配置。远程部署请改用环境变量 DEEPSEEK_API_KEY。' });
+      return;
+    }
+    let cfg;
+    try {
+      const raw = await readBody(req);
+      cfg = raw ? JSON.parse(raw) : {};
+    } catch (e) {
+      sendJSON(res, 400, { error: '请求格式错误，需要 JSON 请求体。' });
+      return;
+    }
+    const key = String(cfg.apiKey || '').trim();
+    if (!isRealKey(key)) {
+      sendJSON(res, 400, { error: '密钥格式不正确：应以 sk- 开头，且不能是示例占位符。' });
+      return;
+    }
+    try {
+      saveApiKey(key);
+    } catch (e) {
+      sendJSON(res, 500, { error: '写入 .env 失败：' + e.message });
+      return;
+    }
+    API_KEY = key;   // 立即生效，无需重启服务
+    console.log('[config] 已通过页面配置 API Key，并写入 .env');
+    sendJSON(res, 200, { ok: true, keyConfigured: true });
     return;
   }
 
@@ -515,8 +572,8 @@ if (require.main === module) {
     console.log('默认模型: ' + DEFAULT_MODEL + '  可选: ' + MODELS.join(' / '));
     if (!API_KEY) {
       console.warn('WARNING: 尚未配置 DEEPSEEK_API_KEY，/api/parse 将返回 500。');
-      console.warn('  本地使用：把 .env.example 复制为 .env，填入 Key 后重启本服务。');
-      console.warn('  或用环境变量：DEEPSEEK_API_KEY=sk-xxx node server.js');
+      console.warn('  最简单的方式：打开简历页面 → 点「✨ 智能填写」，在设置里粘贴密钥（会写回 .env）。');
+      console.warn('  也可以手动：复制 .env.example 为 .env 填入 Key，或用环境变量 DEEPSEEK_API_KEY=sk-xxx。');
     } else if (keyIsPlaceholder()) {
       console.warn('WARNING: DEEPSEEK_API_KEY 看起来是占位符（' + API_KEY.slice(0, 12) + '…），不是真实密钥。');
       console.warn('  请打开 .env，把 DEEPSEEK_API_KEY 换成在 https://platform.deepseek.com 申请的真实 Key。');
