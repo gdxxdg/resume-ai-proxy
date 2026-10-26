@@ -1,0 +1,16 @@
+{
+  "name": "resume-ai-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "简历智能填写 · DeepSeek 语义解析代理服务",
+  "main": "server.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
